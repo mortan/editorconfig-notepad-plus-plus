@@ -94,6 +94,13 @@ void setSyntaxFromFilename();
 void loadConfig();
 
 //
+// The notifications of Notepad++
+//
+void onBufferActivated();
+void onReady();
+void onFileBeforeClose(uptr_t bufferId);
+
+//
 // Parse EditorConfig file
 //
 void onBeforeSave(HWND hWnd, uptr_t idFrom);

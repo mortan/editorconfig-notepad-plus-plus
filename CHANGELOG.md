@@ -1,6 +1,13 @@
 CHANGELOG
 =========
 
+Unreleased
+----------
+
+* Check the encoding of a file against `charset` when it is opened and offer to convert or reinterpret it
+* Warn before saving when characters can't be stored in the `latin1` (ANSI) encoding
+* Show the current encoding of Notepad++ in the settings dialog
+
 Version 0.4.0 (2019-02-21)
 --------------------------
 

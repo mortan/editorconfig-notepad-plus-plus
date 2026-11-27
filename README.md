@@ -105,6 +105,27 @@ The EditorConfig Notepad++ plugin supports the following EditorConfig
 * charset
 * root (only used by EditorConfig core)
 
+## Charset
+
+The `charset` is mapped to the encodings of Notepad++ (menu `Encoding`):
+
+| charset     | Notepad++                                              |
+|-------------|--------------------------------------------------------|
+| `latin1`    | ANSI, the ANSI code page of Windows (e.g. Windows-1252) |
+| `utf-8`     | UTF-8 (without BOM)                                    |
+| `utf-8-bom` | UTF-8-BOM                                              |
+| `utf-16be`  | UTF-16 BE BOM                                          |
+| `utf-16le`  | UTF-16 LE BOM                                          |
+
+Notepad++ detects the encoding of a file itself when it opens the file, a plugin can't change that.
+So the plugin does this:
+
+* When a file is shown for the first time and its encoding differs from the `charset`, the plugin tells you and offers to convert the file. When the content of the file shows that Notepad++ detected the wrong encoding (e.g. valid UTF-8 opened as ANSI), it offers to reinterpret the file instead. Files that only contain ASCII characters are not reported for `latin1` and `utf-8`. Use `Reload EditorConfig for this file` to check again.
+* When a file is saved, it is converted to the `charset`.
+* Before a file is converted to `latin1`, the plugin looks for characters that can't be stored in the ANSI code page. If there are any, it shows where the first ones are and asks. When you answer `No`, the file is saved in its current encoding.
+
+Files that were opened with one of the `Encoding` > `Character sets` are not checked against `latin1` and not converted to it.
+
 ## Fix indentation
 
 In v0.5.0 a new menu item was added to the plugin named `Fix indentation`.
