@@ -23,6 +23,10 @@
 #include "menuCmdID.hpp"
 #include "DlgAbout.hpp"
 
+#include <map>
+#include <memory>
+#include <vector>
+
 //
 // The plugin data that Notepad++ needs
 //
@@ -112,7 +116,512 @@ void setSyntaxFromFilename()
         SendMessage(nppData._nppHandle, NPPM_SETCURRENTLANGTYPE, 0, L_INI);
 }
 
-void loadConfig()
+//
+// Encoding handling
+//
+
+// The values returned by NPPM_GETBUFFERENCODING (UniMode of Notepad++)
+enum
+{
+    NPP_UNI_8BIT = 0,       // ANSI
+    NPP_UNI_UTF8 = 1,       // UTF-8 with BOM
+    NPP_UNI_16BE = 2,       // UTF-16 BE with BOM
+    NPP_UNI_16LE = 3,       // UTF-16 LE with BOM
+    NPP_UNI_COOKIE = 4,     // UTF-8 without BOM
+    NPP_UNI_7BIT = 5,
+    NPP_UNI_16BE_NOBOM = 6,
+    NPP_UNI_16LE_NOBOM = 7
+};
+
+// The values of the EditorConfig "charset" property
+enum EcCharset
+{
+    EC_CHARSET_NONE = 0,    // not specified or unsupported
+    EC_CHARSET_LATIN1,
+    EC_CHARSET_UTF8,
+    EC_CHARSET_UTF8_BOM,
+    EC_CHARSET_UTF16BE,
+    EC_CHARSET_UTF16LE
+};
+
+// Set as soon as Notepad++ has finished starting up
+static bool nppReady = false;
+
+// Set while onBeforeSave() is running
+static bool inBeforeSave = false;
+
+// Set while the encoding check shows a message box
+static bool inEncodingCheck = false;
+
+// The buffers the encoding was already checked for, with the path they had
+static std::map<uptr_t, std::wstring> checkedBuffers;
+
+static EcCharset parseCharset(const char* value)
+{
+    if (strcmp(value, "latin1") == 0)
+        return EC_CHARSET_LATIN1;
+    if (strcmp(value, "utf-8") == 0)
+        return EC_CHARSET_UTF8;
+    if (strcmp(value, "utf-8-bom") == 0)
+        return EC_CHARSET_UTF8_BOM;
+    if (strcmp(value, "utf-16be") == 0)
+        return EC_CHARSET_UTF16BE;
+    if (strcmp(value, "utf-16le") == 0)
+        return EC_CHARSET_UTF16LE;
+    return EC_CHARSET_NONE;
+}
+
+// The "Convert to ..." menu command of Notepad++ for a charset
+static int convertCommand(EcCharset charset)
+{
+    switch (charset)
+    {
+        case EC_CHARSET_LATIN1:     return IDM_FORMAT_CONV2_ANSI;
+        case EC_CHARSET_UTF8:       return IDM_FORMAT_CONV2_AS_UTF_8;
+        case EC_CHARSET_UTF8_BOM:   return IDM_FORMAT_CONV2_UTF_8;
+        case EC_CHARSET_UTF16BE:    return IDM_FORMAT_CONV2_UTF_16BE;
+        case EC_CHARSET_UTF16LE:    return IDM_FORMAT_CONV2_UTF_16LE;
+        default:                    return 0;
+    }
+}
+
+// "latin1" is mapped to the "ANSI" encoding of Notepad++, which is the
+// ANSI code page of the system (e.g. Windows-1252)
+static std::wstring charsetName(EcCharset charset)
+{
+    switch (charset)
+    {
+        case EC_CHARSET_LATIN1:
+        {
+            std::wstringstream name;
+            name << L"latin1 (ANSI, code page " << ::GetACP() << L")";
+            return name.str();
+        }
+        case EC_CHARSET_UTF8:       return L"utf-8 (UTF-8 without BOM)";
+        case EC_CHARSET_UTF8_BOM:   return L"utf-8-bom (UTF-8 with BOM)";
+        case EC_CHARSET_UTF16BE:    return L"utf-16be (UTF-16 BE)";
+        case EC_CHARSET_UTF16LE:    return L"utf-16le (UTF-16 LE)";
+        default:                    return L"";
+    }
+}
+
+static const wchar_t* uniModeName(int uniMode)
+{
+    switch (uniMode)
+    {
+        case NPP_UNI_8BIT:          return L"ANSI";
+        case NPP_UNI_UTF8:          return L"UTF-8 with BOM";
+        case NPP_UNI_16BE:          return L"UTF-16 BE with BOM";
+        case NPP_UNI_16LE:          return L"UTF-16 LE with BOM";
+        case NPP_UNI_COOKIE:        return L"UTF-8 without BOM";
+        case NPP_UNI_7BIT:          return L"7-bit ASCII";
+        case NPP_UNI_16BE_NOBOM:    return L"UTF-16 BE without BOM";
+        case NPP_UNI_16LE_NOBOM:    return L"UTF-16 LE without BOM";
+        default:                    return L"unknown";
+    }
+}
+
+static bool matchesCharset(int uniMode, EcCharset charset)
+{
+    switch (charset)
+    {
+        case EC_CHARSET_LATIN1:     return uniMode == NPP_UNI_8BIT;
+        case EC_CHARSET_UTF8:       return uniMode == NPP_UNI_COOKIE;
+        case EC_CHARSET_UTF8_BOM:   return uniMode == NPP_UNI_UTF8;
+        case EC_CHARSET_UTF16BE:    return uniMode == NPP_UNI_16BE || uniMode == NPP_UNI_16BE_NOBOM;
+        case EC_CHARSET_UTF16LE:    return uniMode == NPP_UNI_16LE || uniMode == NPP_UNI_16LE_NOBOM;
+        default:                    return true;
+    }
+}
+
+//
+// Was the current buffer opened with a specific character set (menu
+// "Encoding" > "Character sets")? NPPM_GETBUFFERENCODING can't tell (it
+// reports "UTF-8 without BOM" for them), so look at the checked menu item.
+//
+static bool hasExplicitCharacterSet()
+{
+    HMENU hMenu = reinterpret_cast<HMENU>(::SendMessage(nppData._nppHandle, NPPM_GETMENUHANDLE, NPPMAINMENU, 0));
+    if (hMenu == NULL)
+        return false;
+
+    for (int id = IDM_FORMAT_ENCODE; id <= IDM_FORMAT_ENCODE_END; ++id)
+    {
+        const UINT state = ::GetMenuState(hMenu, id, MF_BYCOMMAND);
+        if (state != static_cast<UINT>(-1) && (state & MF_CHECKED))
+            return true;
+    }
+    return false;
+}
+
+//
+// Decode one UTF-8 sequence.
+// Returns the length of the sequence, 0 when it is not valid.
+//
+static size_t decodeUtf8(const unsigned char* p, size_t avail, unsigned int& codePoint)
+{
+    if (avail == 0)
+        return 0;
+
+    const unsigned char c = p[0];
+    if (c < 0x80)
+    {
+        codePoint = c;
+        return 1;
+    }
+
+    size_t length;
+    unsigned int minimum;
+    if ((c & 0xE0) == 0xC0)
+    {
+        length = 2;
+        minimum = 0x80;
+        codePoint = c & 0x1F;
+    }
+    else if ((c & 0xF0) == 0xE0)
+    {
+        length = 3;
+        minimum = 0x800;
+        codePoint = c & 0x0F;
+    }
+    else if ((c & 0xF8) == 0xF0)
+    {
+        length = 4;
+        minimum = 0x10000;
+        codePoint = c & 0x07;
+    }
+    else
+        return 0;
+
+    if (avail < length)
+        return 0;
+
+    for (size_t i = 1; i < length; ++i)
+    {
+        if ((p[i] & 0xC0) != 0x80)
+            return 0;
+        codePoint = (codePoint << 6) | (p[i] & 0x3F);
+    }
+
+    // Overlong sequences, surrogates and values beyond Unicode are invalid
+    if (codePoint < minimum || codePoint > 0x10FFFF || (codePoint >= 0xD800 && codePoint <= 0xDFFF))
+        return 0;
+
+    return length;
+}
+
+//
+// Look at the raw bytes of the document: are they pure ASCII, valid UTF-8?
+//
+static void analyseDocument(HWND curScintilla, bool& isAscii, bool& isValidUtf8)
+{
+    isAscii = true;
+    isValidUtf8 = true;
+
+    const size_t length = static_cast<size_t>(::SendMessage(curScintilla, SCI_GETLENGTH, 0, 0));
+    const unsigned char* text = reinterpret_cast<const unsigned char*>(::SendMessage(curScintilla, SCI_GETCHARACTERPOINTER, 0, 0));
+    if (text == nullptr)
+        return;
+
+    for (size_t i = 0; i < length;)
+    {
+        if (text[i] < 0x80)
+        {
+            ++i;
+            continue;
+        }
+
+        isAscii = false;
+
+        unsigned int codePoint;
+        const size_t sequence = decodeUtf8(text + i, length - i, codePoint);
+        if (sequence == 0)
+        {
+            isValidUtf8 = false;
+            return;
+        }
+        i += sequence;
+    }
+}
+
+//
+// Convert a code point to UTF-16. Returns the number of WCHARs.
+//
+static int toUtf16(unsigned int codePoint, WCHAR wc[2])
+{
+    if (codePoint >= 0x10000)
+    {
+        codePoint -= 0x10000;
+        wc[0] = static_cast<WCHAR>(0xD800 + (codePoint >> 10));
+        wc[1] = static_cast<WCHAR>(0xDC00 + (codePoint & 0x3FF));
+        return 2;
+    }
+
+    wc[0] = static_cast<WCHAR>(codePoint);
+    return 1;
+}
+
+//
+// Can the code point be stored in the ANSI code page of the system
+// without changing it?
+//
+static bool isRepresentableInAnsi(unsigned int codePoint)
+{
+    WCHAR wc[2];
+    const int wcLength = toUtf16(codePoint, wc);
+
+    char mb[8];
+    BOOL usedDefaultChar = FALSE;
+    const int mbLength = ::WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, wc, wcLength, mb, sizeof(mb), NULL, &usedDefaultChar);
+    return mbLength > 0 && !usedDefaultChar;
+}
+
+struct UnmappableChar
+{
+    intptr_t        pos;
+    unsigned int    codePoint;
+};
+
+//
+// Find the characters of the document that would get lost when it is
+// converted to ANSI. Returns the number of those characters, the first
+// maxReported ones are added to reported.
+//
+static size_t findUnmappableChars(HWND curScintilla, std::vector<UnmappableChar>& reported, size_t maxReported)
+{
+    // Only when Scintilla holds the document as UTF-8, and not when the
+    // ANSI code page of the system is UTF-8 itself
+    if (::SendMessage(curScintilla, SCI_GETCODEPAGE, 0, 0) != SC_CP_UTF8 || ::GetACP() == CP_UTF8)
+        return 0;
+
+    const size_t length = static_cast<size_t>(::SendMessage(curScintilla, SCI_GETLENGTH, 0, 0));
+    const unsigned char* text = reinterpret_cast<const unsigned char*>(::SendMessage(curScintilla, SCI_GETCHARACTERPOINTER, 0, 0));
+    if (text == nullptr)
+        return 0;
+
+    size_t count = 0;
+    for (size_t i = 0; i < length;)
+    {
+        if (text[i] < 0x80)
+        {
+            ++i;
+            continue;
+        }
+
+        unsigned int codePoint;
+        const size_t sequence = decodeUtf8(text + i, length - i, codePoint);
+        if (sequence == 0)
+        {
+            ++i;
+            continue;
+        }
+
+        if (!isRepresentableInAnsi(codePoint))
+        {
+            ++count;
+            if (reported.size() < maxReported)
+            {
+                UnmappableChar unmappable;
+                unmappable.pos = static_cast<intptr_t>(i);
+                unmappable.codePoint = codePoint;
+                reported.push_back(unmappable);
+            }
+        }
+        i += sequence;
+    }
+
+    return count;
+}
+
+static std::wstring getCurrentFileName()
+{
+    WCHAR fileName[MAX_PATH];
+    fileName[0] = 0;
+    ::SendMessage(nppData._nppHandle, NPPM_GETFILENAME, MAX_PATH, reinterpret_cast<LPARAM>(fileName));
+    return fileName;
+}
+
+//
+// When the document contains characters that can't be stored in ANSI,
+// ask the user what to do. Returns true if the document can be converted.
+//
+static bool confirmConvertToAnsi(HWND curScintilla, int uniMode)
+{
+    const size_t maxReported = 5;
+    std::vector<UnmappableChar> reported;
+    const size_t count = findUnmappableChars(curScintilla, reported, maxReported);
+    if (count == 0)
+        return true;
+
+    std::wstringstream msg;
+    msg << getCurrentFileName() << L"\n\n"
+        << L"The EditorConfig charset of this file is " << charsetName(EC_CHARSET_LATIN1)
+        << L", but " << count << (count == 1 ? L" character" : L" characters")
+        << L" can't be stored in that encoding:\n\n";
+
+    for (size_t i = 0; i < reported.size(); ++i)
+    {
+        const intptr_t pos = reported[i].pos;
+        const intptr_t line = ::SendMessage(curScintilla, SCI_LINEFROMPOSITION, pos, 0);
+        const intptr_t lineStart = ::SendMessage(curScintilla, SCI_POSITIONFROMLINE, line, 0);
+        const intptr_t column = ::SendMessage(curScintilla, SCI_COUNTCHARACTERS, lineStart, pos);
+
+        WCHAR wc[3] = { 0, 0, 0 };
+        toUtf16(reported[i].codePoint, wc);
+
+        WCHAR hex[16];
+        swprintf(hex, 16, L"U+%04X", reported[i].codePoint);
+
+        msg << L"    Line " << (line + 1) << L", column " << (column + 1) << L": " << wc << L" (" << hex << L")\n";
+    }
+    if (count > reported.size())
+        msg << L"    ... and " << (count - reported.size()) << L" more\n";
+
+    msg << L"\nConvert the file anyway? These characters will be lost.\n\n"
+        << L"Yes: convert to ANSI\n"
+        << L"No: keep the current encoding (" << uniModeName(uniMode) << L")";
+
+    return ::MessageBox(nppData._nppHandle, msg.str().c_str(), TEXT("EditorConfig"),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
+}
+
+//
+// Convert the current buffer to the charset of the EditorConfig
+//
+static void convertToCharset(HWND curScintilla, EcCharset charset)
+{
+    const int command = convertCommand(charset);
+    if (command == 0)
+        return;
+
+    if (charset == EC_CHARSET_LATIN1)
+    {
+        const uptr_t bufferId = ::SendMessage(nppData._nppHandle, NPPM_GETCURRENTBUFFERID, 0, 0);
+        const int uniMode = static_cast<int>(::SendMessage(nppData._nppHandle, NPPM_GETBUFFERENCODING, bufferId, 0));
+
+        // Notepad++ only converts to ANSI when the buffer is in one of the
+        // Unicode modes. Don't bother the user when nothing will happen.
+        if (uniMode != NPP_UNI_8BIT && !hasExplicitCharacterSet() && !confirmConvertToAnsi(curScintilla, uniMode))
+            return;
+    }
+
+    ::SendMessage(nppData._nppHandle, NPPM_MENUCOMMAND, 0, command);
+}
+
+//
+// Compare the encoding Notepad++ uses for the current buffer with the
+// charset of the EditorConfig and tell the user when they differ.
+// This is done once per buffer, unless force is set.
+//
+static void checkEncoding(HWND curScintilla, EcCharset charset, bool force)
+{
+    if (charset == EC_CHARSET_NONE || !nppReady || inBeforeSave || inEncodingCheck)
+        return;
+
+    const uptr_t bufferId = ::SendMessage(nppData._nppHandle, NPPM_GETCURRENTBUFFERID, 0, 0);
+
+    WCHAR path[MAX_PATH];
+    path[0] = 0;
+    ::SendMessage(nppData._nppHandle, NPPM_GETFULLCURRENTPATH, MAX_PATH, reinterpret_cast<LPARAM>(path));
+
+    if (!force)
+    {
+        const std::map<uptr_t, std::wstring>::const_iterator it = checkedBuffers.find(bufferId);
+        if (it != checkedBuffers.end() && it->second == path)
+            return;
+    }
+    checkedBuffers[bufferId] = path;
+
+    const int uniMode = static_cast<int>(::SendMessage(nppData._nppHandle, NPPM_GETBUFFERENCODING, bufferId, 0));
+    if (uniMode < 0)
+        return;
+
+    const bool explicitCharacterSet = hasExplicitCharacterSet();
+    if (explicitCharacterSet)
+    {
+        // Notepad++ keeps the selected character set when converting to
+        // ANSI, and it can't be compared with "latin1" from here.
+        if (charset == EC_CHARSET_LATIN1)
+            return;
+    }
+    else if (matchesCharset(uniMode, charset))
+        return;
+
+    // In these modes Scintilla holds the bytes of the file as they are
+    const bool rawBytes = !explicitCharacterSet &&
+            (uniMode == NPP_UNI_8BIT || uniMode == NPP_UNI_COOKIE || uniMode == NPP_UNI_7BIT);
+
+    bool isAscii, isValidUtf8;
+    analyseDocument(curScintilla, isAscii, isValidUtf8);
+
+    // A pure ASCII file is the same in ANSI and in UTF-8 without BOM
+    if (rawBytes && isAscii && (charset == EC_CHARSET_LATIN1 || charset == EC_CHARSET_UTF8))
+        return;
+
+    // Do the bytes of the file tell that Notepad++ picked the wrong encoding?
+    int reinterpretCommand = 0;
+    const wchar_t* reason = L"";
+    const wchar_t* reinterpretAs = L"";
+    if (rawBytes && !isAscii)
+    {
+        if (uniMode == NPP_UNI_COOKIE && charset == EC_CHARSET_LATIN1 && !isValidUtf8)
+        {
+            reinterpretCommand = IDM_FORMAT_ANSI;
+            reason = L"its content is not valid UTF-8";
+            reinterpretAs = L"ANSI";
+        }
+        else if (uniMode == NPP_UNI_8BIT && (charset == EC_CHARSET_UTF8 || charset == EC_CHARSET_UTF8_BOM) && isValidUtf8)
+        {
+            reinterpretCommand = IDM_FORMAT_AS_UTF_8;
+            reason = L"its content is valid UTF-8";
+            reinterpretAs = L"UTF-8";
+        }
+    }
+
+    std::wstringstream msg;
+    msg << getCurrentFileName() << L"\n\n"
+        << L"Notepad++ opened this file ";
+    if (explicitCharacterSet)
+        msg << L"with a specific character set";
+    else
+        msg << L"as " << uniModeName(uniMode);
+    msg << L", but the EditorConfig charset is " << charsetName(charset) << L".\n\n";
+
+    inEncodingCheck = true;
+
+    if (reinterpretCommand != 0)
+    {
+        msg << L"Notepad++ probably detected the encoding incorrectly, because " << reason << L".\n\n";
+
+        if (::SendMessage(curScintilla, SCI_GETMODIFY, 0, 0) != 0)
+        {
+            // Reinterpreting would garble the changes made in the wrong encoding
+            msg << L"The file has unsaved changes, so it is left as it is. "
+                << L"Please check the encoding (menu \"Encoding\") before you save it.";
+            ::MessageBox(nppData._nppHandle, msg.str().c_str(), TEXT("EditorConfig"), MB_OK | MB_ICONWARNING);
+        }
+        else
+        {
+            msg << L"Reinterpret the file as " << reinterpretAs << L"? The file on disk is not changed by this.";
+            if (::MessageBox(nppData._nppHandle, msg.str().c_str(), TEXT("EditorConfig"), MB_YESNO | MB_ICONWARNING) == IDYES)
+                ::SendMessage(nppData._nppHandle, NPPM_MENUCOMMAND, 0, reinterpretCommand);
+        }
+    }
+    else
+    {
+        msg << L"Convert it now? The file on disk changes when you save it.\n\n"
+            << L"If you choose No, the file is converted the next time you save it.";
+        if (::MessageBox(nppData._nppHandle, msg.str().c_str(), TEXT("EditorConfig"), MB_YESNO | MB_ICONWARNING) == IDYES)
+            convertToCharset(curScintilla, charset);
+    }
+
+    inEncodingCheck = false;
+}
+
+//
+// Apply the EditorConfig settings to the current buffer
+//
+static void applyConfig(bool forceEncodingCheck)
 {
     int name_value_count;
     editorconfig_handle eh;
@@ -134,6 +643,7 @@ void loadConfig()
         int             indent_size;
         int             tab_width;
         const char*     end_of_line;
+        EcCharset       charset;
     } ecConf; // obtained EditorConfig settings will be here
 
     memset(&ecConf, 0, sizeof(ecConf));
@@ -161,6 +671,8 @@ void loadConfig()
         }
         else if (!strcmp(name, "end_of_line"))
             ecConf.end_of_line = value;
+        else if (!strcmp(name, "charset"))
+            ecConf.charset = parseCharset(value);
     }
 
     if (ecConf.indent_style) {
@@ -202,6 +714,39 @@ void loadConfig()
     }
 
     editorconfig_handle_destroy(eh);
+
+    // Does the encoding of the buffer match the charset?
+    checkEncoding(curScintilla, ecConf.charset, forceEncodingCheck);
+}
+
+//
+// Menu command "Reload EditorConfig for this file"
+//
+void loadConfig()
+{
+    applyConfig(true);
+}
+
+//
+// The notifications of Notepad++
+//
+void onBufferActivated()
+{
+    setSyntaxFromFilename();
+    applyConfig(false);
+}
+
+void onReady()
+{
+    // No message boxes while Notepad++ is starting, so check the buffer
+    // that is active now
+    nppReady = true;
+    applyConfig(false);
+}
+
+void onFileBeforeClose(uptr_t bufferId)
+{
+    checkedBuffers.erase(bufferId);
 }
 
 //
@@ -310,6 +855,9 @@ static void selectBufferId(HWND hWnd, uptr_t bufferId)
 
 void onBeforeSave(HWND hWnd, uptr_t idFrom)
 {
+    // Activating a buffer must not trigger the encoding check
+    inBeforeSave = true;
+
     const uptr_t keepBufferID = ::SendMessage(hWnd, NPPM_GETCURRENTBUFFERID, 0, 0);
     selectBufferId(hWnd, idFrom);
 
@@ -318,6 +866,7 @@ void onBeforeSave(HWND hWnd, uptr_t idFrom)
     if (!eh || !parseConfig(eh))
     {
         selectBufferId(hWnd, keepBufferID);
+        inBeforeSave = false;
         return;
     }
 
@@ -330,7 +879,7 @@ void onBeforeSave(HWND hWnd, uptr_t idFrom)
     int trim_trailing_whitespace = NPPEC_BOOLVAL_UNSPECIFIED;
     int insert_final_newline = NPPEC_BOOLVAL_UNSPECIFIED;
     int end_of_line = 0;
-    int charset = 0;
+    EcCharset charset = EC_CHARSET_NONE;
 
     int name_value_count = editorconfig_handle_get_name_value_count(eh);
     for (int i = 0; i < name_value_count; ++i) {
@@ -371,16 +920,7 @@ void onBeforeSave(HWND hWnd, uptr_t idFrom)
         // Need to convert the charset of the document?
         if (strcmp(name, "charset") == 0)
         {
-            if (strcmp(value, "latin1") == 0)
-                charset = IDM_FORMAT_CONV2_ANSI;
-            else if (strcmp(value, "utf-8") == 0)
-                charset = IDM_FORMAT_CONV2_AS_UTF_8;
-            else if (strcmp(value, "utf-8-bom") == 0)
-                charset = IDM_FORMAT_CONV2_UTF_8;
-            else if (strcmp(value, "utf-16be") == 0)
-                charset = IDM_FORMAT_CONV2_UTF_16BE;
-            else if (strcmp(value, "utf-16le") == 0)
-                charset = IDM_FORMAT_CONV2_UTF_16LE;
+            charset = parseCharset(value);
             continue;
         }
     }
@@ -409,8 +949,10 @@ void onBeforeSave(HWND hWnd, uptr_t idFrom)
         SendMessage(hWnd, NPPM_MENUCOMMAND, 0, end_of_line);
     }
 
-    if (charset != 0) {
-        SendMessage(hWnd, NPPM_MENUCOMMAND, 0, charset);
+    // Notepad++ does nothing when the buffer already has that encoding. The
+    // user is asked first when characters would get lost.
+    if (charset != EC_CHARSET_NONE) {
+        convertToCharset(curScintilla, charset);
     }
 
     // Restore the folding behavior
@@ -419,6 +961,7 @@ void onBeforeSave(HWND hWnd, uptr_t idFrom)
     editorconfig_handle_destroy(eh);
 
     selectBufferId(hWnd, keepBufferID);
+    inBeforeSave = false;
 }
 
 void showEditorConfigSettings()
@@ -444,6 +987,19 @@ void showEditorConfigSettings()
         editorconfig_handle_get_name_value(eh, i, &name, &value);
         settings << name << " = " << value << std::endl;
     }
+
+    editorconfig_handle_destroy(eh);
+
+    // The charset is only applied when the file is saved, so show what
+    // Notepad++ uses right now
+    const uptr_t bufferId = ::SendMessage(nppData._nppHandle, NPPM_GETCURRENTBUFFERID, 0, 0);
+    const int uniMode = static_cast<int>(::SendMessage(nppData._nppHandle, NPPM_GETBUFFERENCODING, bufferId, 0));
+    settings << std::endl << "Current encoding in Notepad++: ";
+    if (hasExplicitCharacterSet())
+        settings << "specific character set";
+    else
+        settings << uniModeName(uniMode);
+    settings << std::endl;
 
     MessageBox(NULL, settings.str().c_str(), TEXT("EditorConfig"), MB_OK);
 }
